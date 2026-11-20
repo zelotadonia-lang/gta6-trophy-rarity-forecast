@@ -37,10 +37,9 @@ history's own refreshes caused, scaled by how many refreshes the horizon
 should hold. Where the history holds no refresh at all (a flat page, as on
 launch night), the forecast instead uses an honest two-scenario mixture: no
 refresh before the target, or one refresh that dilutes every rate the way
-the launch-night refresh did (about 1.8 logit units, the 638 -> 3,868
-tracked jump the rules describe), with the refresh probability from a
-five-hour prior interval. The quantiles are the mixture's, found by
-bisection on its CDF.
+the launch-night refresh did (tracked 638 -> 3,868, priced per trophy from
+its own rate), with the refresh probability from a five-hour prior
+interval. The quantiles are the mixture's, found by bisection on its CDF.
 
 Edge cases: a trophy at 100% stays there (every tracked player holds it,
 new players get it at once); a trophy at 0% gets a low median with a wide
@@ -82,6 +81,10 @@ RECENT_H = 24.0
 # tracked 638 -> 3,868, a ~1.8 logit fall for a ~1% trophy.
 PRIOR_REFRESH_INTERVAL_H = 5.0
 PRIOR_REFRESH_DROP = 1.8
+# The tracked jump of that launch-night refresh, as a factor: a refresh
+# that dilutes a rate by this factor moves its logit by an amount that
+# depends on the rate itself, so the mixture prices each trophy's own drop.
+DILUTION_PRIOR = 3868.0 / 638.0
 # Largest logit move allowed away from the last read: grows slowly with
 # the horizon, so a long horizon cannot throw a rate across the scale.
 # A move of 1.3 logit units is already a ~3.7x change in the odds.
@@ -103,6 +106,12 @@ def logit(pct):
     return math.log(p / (100.0 - p))
 
 
+def exp_capped(x):
+    """exp with its argument clamped: a steep slope over a long horizon
+    must not overflow (exp overflows past ~709)."""
+    return math.exp(max(-20.0, min(20.0, x)))
+
+
 def inv_logit(lg):
     return 100.0 / (1.0 + math.exp(-max(-30.0, min(30.0, lg))))
 
@@ -122,9 +131,12 @@ def parse_time(text):
     text = text.strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    from datetime import datetime
+    from datetime import datetime, timezone
 
-    return datetime.fromisoformat(text).timestamp()
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def parse_release(game):
@@ -244,13 +256,14 @@ def forecast_case(case, name):
             for k in recent_idx if tracked_vals[k]]
     if len(t_pts) >= 2:
         b_t = recent_slope([p[0] for p in t_pts], [p[1] for p in t_pts], [p[2] for p in t_pts])
-        tracked_target = (last_tracked or 1) * math.exp(b_t * (u_target - u_last))
+        tracked_target = (last_tracked or 1) * exp_capped(b_t * (u_target - u_last))
     else:
         tracked_target = float(last_tracked or 1)
     tracked_target = min(max(tracked_target, float(last_tracked or 1)), GROWTH_CAP * float(last_tracked or 1))
 
     # Refreshes: states where tracked jumped >3% over the previous state.
     refresh_drops = []
+    refresh_spreads = []
     refresh_times = []
     for k in range(1, len(states)):
         prev_tracked = states[k - 1][0][0] or 0
@@ -265,15 +278,23 @@ def forecast_case(case, name):
             if diffs:
                 diffs.sort()
                 refresh_drops.append(diffs[len(diffs) // 2])
+                mean_d = sum(diffs) / len(diffs)
+                refresh_spreads.append(math.sqrt(sum((d - mean_d) ** 2 for d in diffs) / len(diffs)))
                 refresh_times.append(states[k][1])
     if refresh_drops:
         drops_sorted = sorted(refresh_drops)
         med_drop = drops_sorted[len(drops_sorted) // 2]
         refresh_drop = max(0.0, -med_drop)
-        # Spread of the per-refresh median jumps, for the spread term.
-        mean_drop = sum(refresh_drops) / len(refresh_drops)
-        var_drop = sum((d - mean_drop) ** 2 for d in refresh_drops) / len(refresh_drops)
-        refresh_sd = math.sqrt(var_drop)
+        # Spread of the per-refresh median jumps; with a single refresh
+        # there is no spread across events, so the dispersion of that one
+        # refresh's trophies stands in for it.
+        if len(refresh_drops) >= 2:
+            mean_drop = sum(refresh_drops) / len(refresh_drops)
+            var_drop = sum((d - mean_drop) ** 2 for d in refresh_drops) / len(refresh_drops)
+            refresh_sd = math.sqrt(var_drop)
+        else:
+            refresh_sd = refresh_spreads[0] if refresh_spreads else 0.5
+        refresh_sd = max(refresh_sd, 0.15)
         if len(refresh_times) >= 2 and hist_span_days > 0:
             interval_days = hist_span_days / len(refresh_times)
         else:
@@ -297,16 +318,17 @@ def forecast_case(case, name):
 
     rows = []
     for i, trophy in enumerate(trophies):
-        pts = []
-        for k, ((_, rates_k), t_k) in enumerate(states):
-            rate = rates_k[i] if i < len(rates_k) else None
-            if rate is None:
-                continue
-            pts.append((u_vals[k], rate, weights[k], tracked_vals[k], t_k, k))
-        if not pts:
+        # The last read's rate, before any filtering: the 100% and 0%
+        # special cases below are decided on it.
+        raw_last = None
+        for (_, rates_k), _ in reversed(states):
+            if i < len(rates_k) and rates_k[i] is not None:
+                raw_last = rates_k[i]
+                break
+        if raw_last is None:
             rows.append({"id": trophy["id"], "q": [round4(x) for x in (0.05, 0.3, 1.0, 3.0, 12.0)]})
             continue
-        last_rate = pts[-1][1]
+        last_rate = raw_last
         last_lg = logit(last_rate)
 
         # A trophy everyone holds stays held: new players earn it at once.
@@ -322,8 +344,24 @@ def forecast_case(case, name):
             rows.append({"id": trophy["id"], "q": [round4(x) for x in (0.01, 0.01, 0.03, 0.07, 0.21)]})
             continue
 
+        # Fit points: a printed 0.00% is a censored read (fewer earners
+        # than the print's precision shows), not a true zero, so it stays
+        # out of the fits instead of anchoring them at logit -9.21.
+        pts = []
+        for k, ((_, rates_k), t_k) in enumerate(states):
+            rate = rates_k[i] if i < len(rates_k) else None
+            if rate is None or rate <= 0.0:
+                continue
+            pts.append((u_vals[k], rate, weights[k], tracked_vals[k], t_k, k))
+        if not pts:
+            rows.append({"id": trophy["id"], "q": [round4(x) for x in (0.05, 0.3, 1.0, 3.0, 12.0)]})
+            continue
+
         # Trend view on logit(rate), fitted on the recent window only.
+        # When every point sits outside that window, fall back to all of
+        # them rather than fitting a line through nothing.
         r_pts = [p for p in pts if p[5] in recent_set] if len(pts) > 3 else pts
+        r_pts = r_pts or pts
         a_y, b_y, se_y = wls([p[0] for p in r_pts], [logit(p[1]) for p in r_pts], [p[2] for p in r_pts])
         y_trend = a_y + b_y * u_target
         # The fit's own error, floored: a short window can look deceptively
@@ -338,7 +376,7 @@ def forecast_case(case, name):
         if len(e_pts) >= 2:
             b_e = recent_slope([p[0] for p in e_pts], [p[1] for p in e_pts], [p[2] for p in e_pts])
             earners_last = max(last_rate * (last_tracked or 1) / 100.0, 0.0) + 0.5
-            earners_target = earners_last * math.exp(b_e * (u_target - u_last))
+            earners_target = earners_last * exp_capped(b_e * (u_target - u_last))
             earners_target = min(max(earners_target, EARNERS_FLOOR * earners_last),
                                  GROWTH_CAP * earners_last) - 0.5
             rate_struct = 100.0 * max(earners_target, 0.0) / tracked_target
@@ -356,13 +394,16 @@ def forecast_case(case, name):
 
         sigma = math.sqrt((SIGMA_RW * math.sqrt(horizon_days)) ** 2 + se_trend ** 2)
         if not refresh_drops:
-            # No refresh seen: bimodal risk, price it as a mixture.
+            # No refresh seen: bimodal risk, price it as a mixture. The
+            # refresh branch dilutes this trophy's own rate by the prior
+            # factor, so its logit fall is its own, not the ~1% trophy's.
             sigma_mix = max(sigma, 0.15)
             m0 = median_lg
-            m1 = median_lg - refresh_drop
+            drop_i = logit(last_rate) - logit(last_rate / DILUTION_PRIOR)
+            m1 = median_lg - drop_i
             qs = []
             for tau in LEVELS:
-                lo, hi = m0 - refresh_drop - 8 * sigma_mix, m0 + 8 * sigma_mix
+                lo, hi = m0 - drop_i - 8 * sigma_mix, m0 + 8 * sigma_mix
                 for _ in range(80):
                     mid = 0.5 * (lo + hi)
                     f = (1.0 - p_refresh) * norm_cdf((mid - m0) / sigma_mix) + p_refresh * norm_cdf((mid - m1) / sigma_mix)
@@ -379,11 +420,31 @@ def forecast_case(case, name):
     return {"trophies": rows}
 
 
+def fallback_forecast(case):
+    """A wide, low forecast in the right shape, for a case the model
+    cannot read: an invalid case forfeits the prize, so a rough forecast
+    is strictly better than none."""
+    trophies = case.get("trophies") or []
+    return {"trophies": [{"id": t["id"], "q": [0.05, 0.3, 1.0, 3.0, 12.0]} for t in trophies]}
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
+        try:
+            case = json.loads(path.read_text(encoding="utf-8"))
+            forecast = forecast_case(case, path.name)
+        except Exception:
+            # One bad case must not take the whole run down: the other
+            # cases still get their forecasts, and this one gets a rough
+            # but valid one where its trophy list can be read at all.
+            try:
+                case = json.loads(path.read_text(encoding="utf-8"))
+                forecast = fallback_forecast(case)
+                if not forecast["trophies"]:
+                    continue
+            except Exception:
+                continue
         out = json.dumps(forecast, separators=(",", ":")) + "\n"
         (OUTPUT_DIR / f"{path.stem}.out").write_text(out, encoding="utf-8")
 
